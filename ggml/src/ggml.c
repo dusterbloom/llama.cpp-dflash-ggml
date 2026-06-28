@@ -6217,15 +6217,26 @@ struct ggml_tensor * ggml_solve_tri(
 }
 
 // ggml_gated_delta_net
+//
+// K controls the intermediate-state region size appended after the final-state slot:
+//   K=1        → pure AR: allocate ONLY [ attn_output | final_state ].
+//                The CUDA kernel skips per-token intermediate writes (WRITE_INTER=false).
+//   K=n_tokens → tree / persist: also append per-token intermediate-state region.
+//                Layout: [ attn_output | final_state | intermediate_states(n_tokens) ]
+//
+// The public ggml_gated_delta_net() always passes K=1 (pure AR default).
+// ggml_gated_delta_net_tree() calls the internal helper with K=n_tokens.
+// Mirrors upstream's K op-param pattern.
 
-struct ggml_tensor * ggml_gated_delta_net(
+static struct ggml_tensor * ggml_gated_delta_net_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
         struct ggml_tensor  * v,
         struct ggml_tensor  * g,
         struct ggml_tensor  * beta,
-        struct ggml_tensor  * state) {
+        struct ggml_tensor  * state,
+        int64_t               K) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6250,18 +6261,19 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(beta->ne[0] == 1);
 
     GGML_ASSERT(ggml_nelements(state) == S_v * S_v * H * n_seqs);
+    GGML_ASSERT(K >= 1);
 
-    // Pack output, final new_state, and per-step intermediate states into one tensor.
-    // Layout (in units of `S_v * H`-wide rows):
-    //   [ attn_output: n_tokens*n_seqs | final_state: S_v*n_seqs | intermediate_states: S_v*n_tokens*n_seqs ]
-    //
-    // The final_state slot is kept for backward compatibility with stock llama.cpp
-    // callers that read state at offset S_v*H*n_tokens*n_seqs. The intermediate_states
-    // region is a dflash extension: for each token t in [0, n_tokens), it holds the
-    // recurrent state after processing token t. Used by the spec decoding loop to
-    // roll back SSM state to the accepted prefix without a full replay forward pass.
-    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + S_v * n_seqs + S_v * n_tokens * n_seqs, 1, 1 };
+    // K=1 → no intermediate region: [ attn_output: n_tokens*n_seqs | final_state: S_v*n_seqs ]
+    // K=n_tokens → with intermediate region appended: + S_v*n_tokens*n_seqs rows
+    const int64_t inter_rows = (K > 1) ? (S_v * n_tokens * n_seqs) : 0;
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + S_v * n_seqs + inter_rows, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) K);
+    // op_params[1]: in-place state write flag. 0 = write to result+offset (default),
+    // 1 = write directly to state (src[5]->data), eliminating downstream ggml_cpy.
+    // Set by the caller via ggml_gated_delta_net_inplace().
+    ggml_set_op_params_i32(result, 1, /*inplace=*/0);
 
     result->op     = GGML_OP_GATED_DELTA_NET;
     result->src[0] = q;
@@ -6274,8 +6286,40 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+struct ggml_tensor * ggml_gated_delta_net(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state) {
+    // K=1: pure AR — no intermediate region allocated, kernel skips per-token writes.
+    return ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, /*K=*/1);
+}
+
+// In-place variant: kernel writes the updated state directly to state->data,
+// eliminating the downstream ggml_cpy(new_state, ssm_state) graph node.
+// Correct by construction: each CUDA thread reads curr_state[col] before
+// writing state[col] — no write-after-read hazard on the same address.
+// The result tensor still receives the attention output; only the final-state
+// write destination changes. Saves 2 graph nodes per DeltaNet layer.
+struct ggml_tensor * ggml_gated_delta_net_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state) {
+    struct ggml_tensor * result = ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, /*K=*/1);
+    ggml_set_op_params_i32(result, 1, /*inplace=*/1);
+    return result;
+}
+
 // dflash: tree-mode variant. Same op, with parent_ids plumbed into
 // src[6] so the CUDA kernel can branch-reload state at DFS transitions.
+// Uses K=n_tokens so the full per-token intermediate-state region is allocated.
 struct ggml_tensor * ggml_gated_delta_net_tree(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -6285,8 +6329,6 @@ struct ggml_tensor * ggml_gated_delta_net_tree(
         struct ggml_tensor  * beta,
         struct ggml_tensor  * state,
         struct ggml_tensor  * parent_ids) {
-    struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, state);
-
     GGML_ASSERT(parent_ids != NULL);
     GGML_ASSERT(parent_ids->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(parent_ids));
@@ -6295,6 +6337,8 @@ struct ggml_tensor * ggml_gated_delta_net_tree(
     const int64_t n_seqs   = v->ne[3];
     GGML_ASSERT(ggml_nelements(parent_ids) == n_tokens * n_seqs);
 
+    // K=n_tokens: allocate the per-token intermediate-state region for tree rollback.
+    struct ggml_tensor * result = ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, n_tokens);
     result->src[6] = parent_ids;
 
     return result;

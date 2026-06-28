@@ -2547,6 +2547,17 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
 
+    // In-place variant: kernel writes updated state directly to state->data,
+    // eliminating the downstream ggml_cpy(new_state, ssm_state) node.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state);
+
     // dflash extension: tree-mode gated delta net for DDTree-style
     // speculative decoding verify. `parent_ids` is an int32 tensor of shape
     // [n_tokens, n_seqs] where entry [t, s] is the index within sequence s of

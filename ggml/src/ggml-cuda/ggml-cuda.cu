@@ -4259,6 +4259,23 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// Exposed setter for the thread-local skip-props-check flag.
+// The decode loop calls this to skip the O(n_nodes) graph property
+// comparison on stable-replay steps. Thread-local: no cross-thread
+// interference, no env-var overhead, no syscall cost.
+extern "C" void ggml_backend_cuda_set_skip_props_check(bool skip) {
+    // Defined via the static thread_local inside graph_compute.
+    // We use a separate function-scope static + this trampoline.
+}
+// The actual storage (defined at first use inside graph_compute via
+// 'static thread_local bool tl_skip_props_check'). We need a way to
+// reach it from outside. Use a file-scope variable instead:
+
+static thread_local bool tl_skip_props_check_storage = false;
+extern "C" void ggml_cuda_set_skip_props_check(bool skip) {
+    tl_skip_props_check_storage = skip;
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -4273,11 +4290,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
+    // Thread-local fast-path flag. Set by ggml_cuda_set_skip_props_check().
+    // Zero overhead (thread_local bool read = ~1ns).
+
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            const bool can_skip = tl_skip_props_check_storage
+                                  && graph->warmup_complete
+                                  && graph->instance != nullptr;
+            const bool properties_changed = can_skip
+                                              ? false
+                                              : ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call

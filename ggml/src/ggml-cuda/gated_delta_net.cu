@@ -4,6 +4,49 @@
 #endif
 #include <type_traits>
 
+// Minimal kernel-launch wrapper matching upstream ggml_cuda_kernel_launch.
+// Falls through to raw <<<>>> on non-PDL devices (e.g. RTX 3090 / Ampere).
+// On Hopper (CC >= 90) with CUDA >= 12.3 and PDL-enabled builds, uses
+// cudaLaunchKernelEx for programmatic dependent launch overlap.
+struct gdn_launch_params {
+    dim3         grid;
+    dim3         block;
+    size_t       shmem;
+    cudaStream_t stream;
+};
+
+template<typename Kernel, typename... Args>
+static __inline__ void gdn_kernel_launch(Kernel kernel, const gdn_launch_params & lp, Args&&... args) {
+#if defined(GGML_CUDA_USE_PDL)
+    cudaLaunchAttribute attr;
+    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim          = lp.grid;
+    cfg.blockDim         = lp.block;
+    cfg.dynamicSmemBytes = lp.shmem;
+    cfg.stream           = lp.stream;
+    cfg.attrs            = &attr;
+    cfg.numAttrs         = 1;
+    CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...));
+#else
+    kernel<<<lp.grid, lp.block, lp.shmem, lp.stream>>>(std::forward<Args>(args)...);
+    CUDA_CHECK(cudaGetLastError());
+#endif
+}
+
+// PDL device-side signal: on Hopper+CUDA>=12.3 with GGML_CUDA_USE_PDL, this
+// notifies the PDL scheduler that the current kernel's prior work is visible
+// to dependent kernels. On Ampere (RTX 3090, CC86) and any build without
+// GGML_CUDA_USE_PDL, falls through to a no-op.
+#if defined(GGML_CUDA_USE_PDL) && !defined(GGML_USE_HIP)
+static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
+    cudaTriggerProgrammaticLaunchCompletion();
+}
+#else
+static __device__ __forceinline__ void ggml_cuda_pdl_sync() {}
+#endif
+
 // Tree-mode parent index sentinel: a node whose parent is the pre-block state
 // (i.e. a "root" node in the DFS-flattened tree) uses this value in
 // parent_ids[]. Any value < 0 triggers a reload from curr_state.
@@ -26,7 +69,9 @@ static __device__ __forceinline__ void store_inter_state(__half * p, int idx, fl
     p[idx] = __float2half(v);
 }
 
-template <int S_v, bool KDA, bool TREE_MODE, typename InterT = float>
+// WRITE_INTER=true  → write per-token intermediate states (tree / persist / chain-capture paths)
+// WRITE_INTER=false → pure AR: skip intermediate writes, write ONLY final state at loop end
+template <int S_v, bool KDA, bool TREE_MODE, bool WRITE_INTER, typename InterT = float>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
@@ -35,6 +80,7 @@ gated_delta_net_cuda(const float * q,
                                      const float * beta,
                                      const float * curr_state,
                                      float *       dst,
+                                     float *       state_out,    // in-place: src[5]->data; else dst + attn_score_elems
                                      const int *   parent_ids,    // TREE_MODE only; else ignored
                                      InterT *      persist_inter, // optional external buffer for per-token intermediates
                                      int64_t       H,
@@ -64,29 +110,32 @@ gated_delta_net_cuda(const float * q,
     const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
     const int64_t final_state_elems = S_v * S_v * H * n_seqs;
     float *       attn_data        = dst;
-    float *       state            = dst + attn_score_elems;
-    // intermediate_states region: one S_v*S_v*H*n_seqs state per token. Written
-    // inside the token loop below (one state per `t`) to enable spec-decode
-    // rollback without a replay forward pass. See ggml.c::ggml_gated_delta_net.
-    //
-    // dflash27b_ggml: if persist_inter != nullptr, the kernel writes the
-    // intermediate states DIRECTLY to that external buffer instead of the
-    // embedded region inside dst. InterT selects the storage precision (float
-    // or __half). f16 halves the memory footprint — enough to fit larger
-    // DDtree budgets on the 24 GB 3090.
-    // When persist_inter is null, InterT MUST be float (the embedded region
-    // inside dst is f32).
-    InterT * inter_states = persist_inter
-        ? persist_inter
-        : (InterT *)(dst + attn_score_elems + final_state_elems);
+    // In-place state update: when state_out != dst + attn_score_elems, the
+    // kernel writes the updated state directly to the persistent state buffer
+    // (src[5]->data), eliminating the downstream ggml_cpy graph node.
+    float *       state            = state_out;
+
+    // intermediate_states: only needed (and only allocated in dst) when WRITE_INTER=true
+    // or TREE_MODE=true (tree reload reads from it). When neither applies (pure AR),
+    // the pointer is set to nullptr and never dereferenced.
+    // Guard the computation with (WRITE_INTER || TREE_MODE) so we never compute an
+    // out-of-bounds address into dst when K=1 (no intermediate region allocated).
+    InterT * inter_states = nullptr;
+    InterT * inter_base   = nullptr;
+    if constexpr (WRITE_INTER || TREE_MODE) {
+        // dflash27b_ggml: if persist_inter != nullptr, write directly to the external
+        // buffer (f32 or f16). Otherwise write to the embedded region inside dst
+        // (always f32, immediately after the final-state slot).
+        inter_states = persist_inter
+            ? persist_inter
+            : (InterT *)(dst + attn_score_elems + final_state_elems);
+        inter_base = inter_states + (sequence * n_tokens * H + h_idx) * S_v * S_v;
+    }
 
     const int64_t state_offset = (sequence * H + h_idx) * S_v * S_v;
     state += state_offset;
     curr_state += state_offset + col * S_v;
     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
-    // Per-sequence per-head base for this block's intermediates, token t=0.
-    // Advance by (H * S_v * S_v) each iteration.
-    InterT * inter_base = inter_states + (sequence * n_tokens * H + h_idx) * S_v * S_v;
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
     static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
@@ -94,6 +143,7 @@ gated_delta_net_cuda(const float * q,
     float         s_shard[rows_per_lane];
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
 
+    ggml_cuda_pdl_sync();
 #pragma unroll
     for (int r = 0; r < rows_per_lane; r++) {
         const int i = r * warp_size + lane;
@@ -227,12 +277,16 @@ gated_delta_net_cuda(const float * q,
         // Write the intermediate state for token t (same transposed layout as the
         // final-state write below). Used by dflash27b_ggml spec-decode rollback.
         // store_inter_state converts float → InterT (f32 passthrough or __float2half).
+        // WRITE_INTER=false in pure AR: skip this entirely; only the final state
+        // written unconditionally after the loop is ever read.
+        if constexpr (WRITE_INTER) {
 #pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
-            const int i = r * warp_size + lane;
-            store_inter_state(inter_base, col * S_v + i, s_shard[r]);
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i = r * warp_size + lane;
+                store_inter_state(inter_base, col * S_v + i, s_shard[r]);
+            }
+            inter_base += S_v * S_v * H;
         }
-        inter_base += S_v * S_v * H;
 
         attn_data += S_v * H;
     }
@@ -245,11 +299,11 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
-template <bool KDA, bool TREE_MODE, typename InterT = float>
+template <bool KDA, bool TREE_MODE, bool WRITE_INTER, typename InterT = float>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
         const float * g_d, const float * b_d, const float * s_d,
-        float * dst_d,
+        float * dst_d,  float * state_out_d,
         const int * parent_ids_d,
         InterT * persist_inter_d,
         int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
@@ -267,35 +321,33 @@ static void launch_gated_delta_net(
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
 
-    int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const gdn_launch_params lp{grid_dims, block_dims, 0, stream};
 
     switch (S_v) {
         case 16:
-            gated_delta_net_cuda<16, KDA, TREE_MODE, InterT><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, parent_ids_d, persist_inter_d, H,
+            gdn_kernel_launch(gated_delta_net_cuda<16, KDA, TREE_MODE, WRITE_INTER, InterT>, lp,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
             break;
         case 32:
-            gated_delta_net_cuda<32, KDA, TREE_MODE, InterT><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, parent_ids_d, persist_inter_d, H,
+            gdn_kernel_launch(gated_delta_net_cuda<32, KDA, TREE_MODE, WRITE_INTER, InterT>, lp,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
             break;
-        case 64: {
-            gated_delta_net_cuda<64, KDA, TREE_MODE, InterT><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, parent_ids_d, persist_inter_d, H,
+        case 64:
+            gdn_kernel_launch(gated_delta_net_cuda<64, KDA, TREE_MODE, WRITE_INTER, InterT>, lp,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
             break;
-        }
-        case 128: {
-            gated_delta_net_cuda<128, KDA, TREE_MODE, InterT><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, parent_ids_d, persist_inter_d, H,
+        case 128:
+            gdn_kernel_launch(gated_delta_net_cuda<128, KDA, TREE_MODE, WRITE_INTER, InterT>, lp,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
             break;
-        }
         default:
             GGML_ABORT("fatal error");
             break;
@@ -346,6 +398,14 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     const float * s_d   = (const float *) src_state->data;
     float *       dst_d = (float *) dst->data;
+
+    // In-place state: when op_params[1] == 1, write the updated state directly
+    // to src_state->data (in-place), skipping the downstream ggml_cpy. Safe
+    // because each thread reads curr_state[col] before writing state[col] —
+    // no cross-thread write-after-read hazard on the same address.
+    const int inplace = ggml_get_op_params_i32(dst, 1);
+    const int64_t attn_score_elems_local = nev0 * nev1 * nev2 * nev3;
+    float * state_out_d = inplace ? (float *)src_state->data : dst_d + attn_score_elems_local;
     const int *   parent_ids_d = src_parent
         ? (const int *) src_parent->data
         : nullptr;
@@ -389,38 +449,57 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     cudaStream_t stream = ctx.stream();
 
-    const bool tree_mode = (parent_ids_d != nullptr);
+    const bool tree_mode  = (parent_ids_d  != nullptr);
+    // Pure AR: no tree branching and no intermediate-state capture of any kind.
+    // The result tensor was allocated without an intermediate region (K=1 in ggml.c).
+    // The kernel skips all per-token intermediate writes — saves the 3× per-token
+    // global-store loop that dominated SSM decode time (~28% of decode step).
+    // Tree and persist paths always set write_inter=true and use K=n_tokens tensors.
+    const bool write_inter = tree_mode || (persist_inter_d != nullptr);
 
-    // Macro to expand the 4 (KDA × TREE_MODE) cases for a given InterT.
+    // Macro to expand the 8 (KDA × TREE_MODE × WRITE_INTER) cases for a given InterT.
     // The persist_is_f16 branch picks between __half and float instantiations.
-    #define GDN_LAUNCH(INTER_T)                                                                 \
-        do {                                                                                    \
-            INTER_T * persist_typed = (INTER_T *)persist_inter_d;                               \
-            if (kda) {                                                                          \
-                if (tree_mode) {                                                                \
-                    launch_gated_delta_net<true, true, INTER_T>(                                \
-                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, parent_ids_d, persist_typed,       \
-                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
-                } else {                                                                        \
-                    launch_gated_delta_net<true, false, INTER_T>(                               \
-                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, nullptr, persist_typed,            \
-                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
-                }                                                                               \
-            } else {                                                                            \
-                if (tree_mode) {                                                                \
-                    launch_gated_delta_net<false, true, INTER_T>(                               \
-                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, parent_ids_d, persist_typed,       \
-                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
-                } else {                                                                        \
-                    launch_gated_delta_net<false, false, INTER_T>(                               \
-                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, nullptr, persist_typed,            \
-                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
-                }                                                                               \
-            }                                                                                   \
+    #define GDN_LAUNCH(INTER_T)                                                                     \
+        do {                                                                                        \
+            INTER_T * persist_typed = (INTER_T *)persist_inter_d;                                   \
+            if (kda) {                                                                              \
+                if (tree_mode) {                                                                    \
+                    /* TREE_MODE=true always implies WRITE_INTER=true */                            \
+                    launch_gated_delta_net<true, true, true, INTER_T>(                              \
+                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, parent_ids_d, persist_typed,           \
+                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                     \
+                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                                  \
+                } else if (write_inter) {                                                           \
+                    /* No tree, but persist_inter requested: chain verify / cap path */             \
+                    launch_gated_delta_net<true, false, true, INTER_T>(                             \
+                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, nullptr, persist_typed,               \
+                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                     \
+                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                                  \
+                } else {                                                                            \
+                    /* Pure AR: skip intermediate writes entirely */                                \
+                    launch_gated_delta_net<true, false, false, INTER_T>(                            \
+                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, nullptr, persist_typed,               \
+                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                     \
+                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                                  \
+                }                                                                                   \
+            } else {                                                                                \
+                if (tree_mode) {                                                                    \
+                    launch_gated_delta_net<false, true, true, INTER_T>(                             \
+                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, parent_ids_d, persist_typed,           \
+                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                     \
+                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                                  \
+                } else if (write_inter) {                                                           \
+                    launch_gated_delta_net<false, false, true, INTER_T>(                            \
+                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, nullptr, persist_typed,               \
+                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                     \
+                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                                  \
+                } else {                                                                            \
+                    launch_gated_delta_net<false, false, false, INTER_T>(                           \
+                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, nullptr, persist_typed,               \
+                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                     \
+                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                                  \
+                }                                                                                   \
+            }                                                                                       \
         } while (0)
 
     if (persist_is_f16) {
